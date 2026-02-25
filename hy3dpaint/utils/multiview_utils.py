@@ -18,48 +18,109 @@ import random
 import numpy as np
 from PIL import Image
 from typing import List
-import huggingface_hub
 from omegaconf import OmegaConf
 from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
 from ..hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
 
+# Global cache for multiviewDiffusionNet instances
+_mvd_cache: dict = {}
+
+def get_mvd_cache_key(config, paint_model=None):
+    """Generate a cache key from config + paint_model identity."""
+    return (config.multiview_cfg_path, config.scheduler, config.device, id(paint_model))
+
+def clear_mvd_cache():
+    """Clear the multiview diffusion net cache."""
+    global _mvd_cache
+    _mvd_cache.clear()
+
 
 class multiviewDiffusionNet:
-    def __init__(self, config) -> None:
+    def __init__(self, config, paint_model=None) -> None:
+        global _mvd_cache
+
+        # Check cache for existing instance
+        cache_key = get_mvd_cache_key(config, paint_model)
+        if cache_key in _mvd_cache:
+            cached = _mvd_cache[cache_key]
+            print("[multiviewDiffusionNet] Cache hit — reusing existing instance")
+            self.device = cached.device
+            self.cfg = cached.cfg
+            self.mode = cached.mode
+            self.pipeline = cached.pipeline
+            if hasattr(cached, 'dino_v2'):
+                self.dino_v2 = cached.dino_v2
+            return
+
+        print("[multiviewDiffusionNet] Cache miss — creating new instance")
         self.device = config.device
 
         cfg_path = config.multiview_cfg_path
-        custom_pipeline = config.custom_pipeline
         cfg = OmegaConf.load(cfg_path)
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
-        model_path = huggingface_hub.snapshot_download(
-            repo_id=config.multiview_pretrained_path,
-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
-        )
+        if paint_model is not None:
+            # Use pre-loaded models from the loader node
+            pipeline = paint_model["pipeline"]
 
-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
-                
-        pipeline = HunyuanPaintPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16
-        )
+            if config.scheduler == "UniPCMultistep":
+                pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+            elif config.scheduler == "DDIM":
+                pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+            else:
+                pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
+            pipeline.set_progress_bar_config(disable=False)
+            pipeline.eval()
+            setattr(pipeline, "view_size", cfg.model.params.get("view_size", 320))
+            self.pipeline = pipeline.to(self.device)
+            self.pipeline.enable_vae_slicing()
+            self.pipeline.enable_vae_tiling()
 
-        pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
-        pipeline.set_progress_bar_config(disable=False)
-        pipeline.eval()
-        setattr(pipeline, "view_size", cfg.model.params.get("view_size", 320))
-        pipeline.enable_model_cpu_offload()
-        self.pipeline = pipeline.to(self.device)
-        self.pipeline.enable_vae_slicing()
-        self.pipeline.enable_vae_tiling()
+            if paint_model.get("dino_v2") is not None:
+                self.dino_v2 = paint_model["dino_v2"].to(torch.float16).to(self.device)
+            elif hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+                from ..hunyuanpaintpbr.unet.modules import Dino_v2
+                dino_path = getattr(config, 'dino_ckpt_path', 'facebook/dinov2-giant')
+                self.dino_v2 = Dino_v2(dino_path).to(torch.float16).to(self.device)
+        else:
+            # Fallback: download from HuggingFace Hub (for direct Python usage)
+            import huggingface_hub
 
-        if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
-            from ..hunyuanpaintpbr.unet.modules import Dino_v2
-            self.dino_v2 = Dino_v2(config.dino_ckpt_path).to(torch.float16)
-            self.dino_v2 = self.dino_v2.to(self.device)
+            pretrained_path = getattr(config, 'multiview_pretrained_path', 'tencent/Hunyuan3D-2.1')
+            model_path = huggingface_hub.snapshot_download(
+                repo_id=pretrained_path,
+                allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
+            )
+
+            model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
+
+            pipeline = HunyuanPaintPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16
+            )
+
+            if config.scheduler == "UniPCMultistep":
+                pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+            elif config.scheduler == "DDIM":
+                pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+            else:
+                pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
+            pipeline.set_progress_bar_config(disable=False)
+            pipeline.eval()
+            setattr(pipeline, "view_size", cfg.model.params.get("view_size", 320))
+            self.pipeline = pipeline.to(self.device)
+            self.pipeline.enable_vae_slicing()
+            self.pipeline.enable_vae_tiling()
+
+            if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+                from ..hunyuanpaintpbr.unet.modules import Dino_v2
+                dino_path = getattr(config, 'dino_ckpt_path', 'facebook/dinov2-giant')
+                self.dino_v2 = Dino_v2(dino_path).to(torch.float16).to(self.device)
+
+        # Store in cache
+        _mvd_cache[cache_key] = self
 
     def seed_everything(self, seed):
         random.seed(seed)
@@ -68,13 +129,13 @@ class multiviewDiffusionNet:
         os.environ["PL_GLOBAL_SEED"] = str(seed)
 
     @torch.no_grad()
-    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False, num_steps=10, guidance_scale=3.0, seed=0):
+    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False, num_steps=10, guidance_scale=3.0, seed=0, camera_azims=None, guidance_rescale=0.0):
         pils = self.forward_one(
-            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input, num_steps=num_steps, guidance_scale=guidance_scale, seed=seed
+            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input, num_steps=num_steps, guidance_scale=guidance_scale, seed=seed, camera_azims=camera_azims, guidance_rescale=guidance_rescale
         )
         return pils
 
-    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False, num_steps=10, guidance_scale=3.0, seed=0):
+    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False, num_steps=10, guidance_scale=3.0, seed=0, camera_azims=None, guidance_rescale=0.0):
         self.seed_everything(seed)
         custom_view_size = custom_view_size if custom_view_size is not None else self.pipeline.view_size
         
@@ -103,6 +164,11 @@ class multiviewDiffusionNet:
         kwargs["num_in_batch"] = num_view
         kwargs["images_normal"] = normal_image
         kwargs["images_position"] = position_image
+
+        if camera_azims is not None:
+            kwargs["camera_azims"] = camera_azims
+
+        kwargs["guidance_rescale"] = guidance_rescale
 
         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
             dino_hidden_states = self.dino_v2(input_images[0])

@@ -49,6 +49,120 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 diffusions_dir = os.path.join(comfy_path, "models", "diffusers")
 
+# Register custom model folders for Hunyuan3D paint models
+hunyuan3d_paint_path = os.path.join(folder_paths.models_dir, "hunyuan3d", "paintpbr")
+os.makedirs(hunyuan3d_paint_path, exist_ok=True)
+hunyuan3d_dinov2_path = os.path.join(folder_paths.models_dir, "hunyuan3d", "dinov2")
+os.makedirs(hunyuan3d_dinov2_path, exist_ok=True)
+
+def get_hunyuan3d_paint_models():
+    base = os.path.join(folder_paths.models_dir, "hunyuan3d", "paintpbr")
+    if not os.path.isdir(base):
+        return []
+    models = []
+    for name in os.listdir(base):
+        candidate = os.path.join(base, name)
+        if os.path.isdir(candidate) and (
+            os.path.exists(os.path.join(candidate, "model_index.json")) or
+            os.path.exists(os.path.join(candidate, "unet", "config.json"))
+        ):
+            models.append(name)
+    return models if models else ["(no models found)"]
+
+# --- Paint pipeline cache ---
+_paint_pipeline_cache: dict = {}
+
+def _get_or_create_paint_pipeline(config, paint_model=None):
+    """Return a cached Hunyuan3DPaintPipeline or create a new one.
+
+    Cache key is based on structural params that affect MeshRender init.
+    Runtime params (azims, elevs, weights, etc.) are updated on the config of a cached hit.
+    """
+    global _paint_pipeline_cache
+    cache_key = (
+        config.render_size,
+        config.texture_size,
+        config.bake_mode,
+        config.raster_mode,
+        config.ortho_scale,
+        config.camera_distance,
+        config.bake_angle_thres,
+        id(paint_model),
+    )
+    if cache_key in _paint_pipeline_cache:
+        pipeline = _paint_pipeline_cache[cache_key]
+        # Update config with fresh runtime params (azims, elevs, weights, etc.)
+        pipeline.config = config
+        print("[PaintPipeline] Cache hit — reusing existing pipeline")
+        return pipeline
+
+    print("[PaintPipeline] Cache miss — creating new pipeline")
+    pipeline = Hunyuan3DPaintPipeline(config, paint_model=paint_model)
+    pipeline._cached = True
+    _paint_pipeline_cache[cache_key] = pipeline
+    return pipeline
+
+# --- Upscale model cache ---
+_upscale_model_cache: dict = {}
+
+def _get_or_load_upscale_model(model_name, device):
+    """Load an upscale model via spandrel, caching by model name."""
+    global _upscale_model_cache
+    if model_name in _upscale_model_cache:
+        model = _upscale_model_cache[model_name]
+        model.to(device)
+        print(f"[Upscale] Cache hit — reusing model '{model_name}'")
+        return model
+
+    print(f"[Upscale] Loading model '{model_name}'...")
+    model_path = folder_paths.get_full_path_or_raise("upscale_models", model_name)
+    sd = comfy.utils.load_torch_file(model_path, safe_load=True)
+    if "module.layers.0.residual_group.blocks.0.norm1.weight" in sd:
+        sd = comfy.utils.state_dict_prefix_replace(sd, {"module.": ""})
+    upscale_model = ModelLoader().load_from_state_dict(sd).eval()
+
+    if not isinstance(upscale_model, ImageModelDescriptor):
+        raise ValueError("Upscale model must be a single-image model.")
+
+    upscale_model.to(device)
+    _upscale_model_cache[model_name] = upscale_model
+    return upscale_model
+
+def _upscale_images(images_tensor, upscale_model, device):
+    """Upscale a batch of images using tiled_scale with OOM tile-halving fallback.
+
+    Args:
+        images_tensor: (B, H, W, C) float tensor in [0, 1]
+        upscale_model: spandrel ImageModelDescriptor
+        device: torch device
+    Returns:
+        (B, H*scale, W*scale, C) float tensor clamped to [0, 1]
+    """
+    in_img = images_tensor.movedim(-1, -3).to(device)
+    tile = 512
+    overlap = 32
+
+    oom = True
+    while oom:
+        try:
+            steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(
+                in_img.shape[3], in_img.shape[2], tile_x=tile, tile_y=tile, overlap=overlap
+            )
+            pbar = comfy.utils.ProgressBar(steps)
+            s = comfy.utils.tiled_scale(
+                in_img, lambda a: upscale_model(a),
+                tile_x=tile, tile_y=tile, overlap=overlap,
+                upscale_amount=upscale_model.scale, pbar=pbar
+            )
+            oom = False
+        except mm.OOM_EXCEPTION as e:
+            tile //= 2
+            if tile < 128:
+                raise e
+
+    return torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
+
+
 def parse_string_to_int_list(number_string):
   """
   Parses a string containing comma-separated numbers into a list of integers.
@@ -268,7 +382,7 @@ class Hy3DMeshGenerator:
     RETURN_TYPES = ("HY3DLATENT",)
     RETURN_NAMES = ("latents",)
     FUNCTION = "loadmodel"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def loadmodel(self, model, image, steps, guidance_scale, seed, attention_mode):
         device = mm.get_torch_device()
@@ -335,7 +449,7 @@ class Hy3DMeshGenerator:
     # RETURN_TYPES = ("HY3DLATENT",)
     # RETURN_NAMES = ("latents",)
     # FUNCTION = "loadmodel"
-    # CATEGORY = "Hunyuan3D21Wrapper"
+    # CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     # def loadmodel(self, model, steps, guidance_scale, seed, attention_mode, front = None, left = None, back = None, right = None):
         # device = mm.get_torch_device()
@@ -394,6 +508,60 @@ class Hy3DMeshGenerator:
         
         # return (latents,)        
         
+class Hy3DPaintModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (get_hunyuan3d_paint_models(), {
+                    "tooltip": "Select PaintPBR model from ComfyUI/models/hunyuan3d/paintpbr/"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DPAINTMODEL",)
+    RETURN_NAMES = ("paint_model",)
+    FUNCTION = "loadmodel"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
+
+    def loadmodel(self, model_name):
+        from .hy3dpaint.hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
+
+        model_path = os.path.join(folder_paths.models_dir, "hunyuan3d", "paintpbr", model_name)
+
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(f"Paint model not found at: {model_path}")
+
+        print(f"Loading PaintPBR model from: {model_path}")
+        pipeline = HunyuanPaintPipeline.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16
+        )
+
+        # Load DINOv2 if available
+        dino_v2 = None
+        dinov2_base = os.path.join(folder_paths.models_dir, "hunyuan3d", "dinov2")
+        dino_path = None
+
+        # Check for dino subfolder inside the model folder first
+        dino_in_model = os.path.join(model_path, "dino")
+        if os.path.isdir(dino_in_model):
+            dino_path = dino_in_model
+        elif os.path.isdir(dinov2_base):
+            # Check shared dinov2 folder for any subfolder
+            for name in os.listdir(dinov2_base):
+                candidate = os.path.join(dinov2_base, name)
+                if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "config.json")):
+                    dino_path = candidate
+                    break
+
+        if dino_path is not None:
+            from .hy3dpaint.hunyuanpaintpbr.unet.modules import Dino_v2
+            print(f"Loading DINOv2 from: {dino_path}")
+            dino_v2 = Dino_v2(dino_path)
+
+        return ({"pipeline": pipeline, "dino_v2": dino_v2},)
+
 class Hy3DMultiViewsGenerator:
     @classmethod
     def INPUT_TYPES(s):
@@ -409,35 +577,54 @@ class Hy3DMultiViewsGenerator:
                 "unwrap_mesh": ("BOOLEAN", {"default":True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             },
+            "optional": {
+                "paint_model": ("HY3DPAINTMODEL", {"tooltip": "Pre-loaded paint model from Hy3DPaintModelLoader"}),
+                "scheduler": (["EulerAncestralDiscrete", "UniPCMultistep", "DDIM"], {"default": "EulerAncestralDiscrete", "tooltip": "Diffusion scheduler algorithm"}),
+                "render_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 256, "tooltip": "Resolution for rendering normal/position views"}),
+                "bake_exp": ("INT", {"default": 4, "min": 1, "max": 10, "step": 1, "tooltip": "Cosine weighting exponent for texture baking"}),
+                "bake_angle_thres": ("FLOAT", {"default": 75.0, "min": 30.0, "max": 89.0, "step": 1.0, "tooltip": "Max angle for view contribution during baking"}),
+                "bake_mode": (["back_sample", "linear", "mip-map"], {"default": "back_sample", "tooltip": "Texture baking interpolation method"}),
+                "camera_distance": ("FLOAT", {"default": 1.1, "min": 0.5, "max": 3.0, "step": 0.1, "tooltip": "Camera distance to mesh center"}),
+                "guidance_rescale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "CFG rescale to fix overexposure"}),
+                "mesh_scale_factor": ("FLOAT", {"default": 1.15, "min": 0.5, "max": 2.0, "step": 0.05, "tooltip": "Mesh normalization scale"}),
+            },
         }
 
     RETURN_TYPES = ("HY3DPIPELINE", "IMAGE","IMAGE","IMAGE","IMAGE","HY3D21CAMERA","HY3D21METADATA",)
     RETURN_NAMES = ("pipeline", "albedo","mr","positions","normals","camera_config", "metadata")
     FUNCTION = "genmultiviews"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
-    def genmultiviews(self, trimesh, camera_config, view_size, image, steps, guidance_scale, texture_size, unwrap_mesh, seed):
+    def genmultiviews(self, trimesh, camera_config, view_size, image, steps, guidance_scale, texture_size, unwrap_mesh, seed,
+                       paint_model=None, scheduler="EulerAncestralDiscrete", render_size=1024, bake_exp=4, bake_angle_thres=75.0,
+                       bake_mode="back_sample", camera_distance=1.1, guidance_rescale=0.0, mesh_scale_factor=1.15):
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()
-        
+
         seed = seed % (2**32)
-        
-        conf = Hunyuan3DPaintConfig(view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"], camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
-        
+
+        conf = Hunyuan3DPaintConfig(
+            view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"],
+            camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size,
+            scheduler=scheduler, render_size=render_size, bake_exp=bake_exp, bake_angle_thres=bake_angle_thres,
+            bake_mode=bake_mode, camera_distance=camera_distance, guidance_rescale=guidance_rescale,
+            mesh_scale_factor=mesh_scale_factor
+        )
+        paint_pipeline = _get_or_create_paint_pipeline(conf, paint_model=paint_model)
+
         image = tensor2pil(image)
-        
+
         temp_folder_path = os.path.join(comfy_path, "temp")
-        os.makedirs(temp_folder_path, exist_ok=True)        
+        os.makedirs(temp_folder_path, exist_ok=True)
         temp_output_path = os.path.join(temp_folder_path, "textured_mesh.obj")
-        
-        albedo, mr, normal_maps, position_maps = paint_pipeline(mesh=trimesh, image_path=image, output_mesh_path=temp_output_path, num_steps=steps, guidance_scale=guidance_scale, unwrap=unwrap_mesh, seed=seed)
-        
+
+        albedo, mr, normal_maps, position_maps = paint_pipeline(mesh=trimesh, image_path=image, output_mesh_path=temp_output_path, num_steps=steps, guidance_scale=guidance_scale, unwrap=unwrap_mesh, seed=seed, guidance_rescale=guidance_rescale)
+
         albedo_tensor = hy3dpaintimages_to_tensor(albedo)
         mr_tensor = hy3dpaintimages_to_tensor(mr)
         normals_tensor = hy3dpaintimages_to_tensor(normal_maps)
-        positions_tensor = hy3dpaintimages_to_tensor(position_maps)            
-        
+        positions_tensor = hy3dpaintimages_to_tensor(position_maps)
+
         return (paint_pipeline, albedo_tensor, mr_tensor, positions_tensor, normals_tensor, camera_config,)       
         
 class Hy3DBakeMultiViews:
@@ -455,7 +642,7 @@ class Hy3DBakeMultiViews:
     RETURN_TYPES = ("HY3DPIPELINE", "NPARRAY", "NPARRAY", "NPARRAY", "NPARRAY", "IMAGE", "IMAGE",)
     RETURN_NAMES = ("pipeline", "albedo", "albedo_mask", "mr", "mr_mask", "albedo_texture", "mr_texture",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, pipeline, camera_config, albedo, mr):        
         albedo = convert_tensor_images_to_pil(albedo)
@@ -487,25 +674,23 @@ class Hy3DInPaint:
                 "mr_mask": ("NPARRAY",),
                 "output_mesh_name": ("STRING",),
             },
+            "optional": {
+                "vertex_inpaint": ("BOOLEAN", {"default": True, "tooltip": "Use mesh-aware inpainting first pass"}),
+                "inpaint_method": (["NS", "TELEA"], {"default": "NS", "tooltip": "OpenCV inpainting algorithm"}),
+                "inpaint_radius": ("INT", {"default": 3, "min": 1, "max": 30, "step": 1, "tooltip": "Pixel radius for inpainting neighborhood"}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE","IMAGE","TRIMESH", "STRING",)
     RETURN_NAMES = ("albedo", "mr", "trimesh", "output_glb_path")
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     OUTPUT_NODE = True
 
-    def process(self, pipeline, albedo, albedo_mask, mr, mr_mask, output_mesh_name):
-        
-        #albedo = tensor2pil(albedo)
-        #albedo_mask = tensor2pil(albedo_mask)
-        #mr = tensor2pil(mr)
-        #mr_mask = tensor2pil(mr_mask)       
-        
-        vertex_inpaint = True
-        method = "NS"       
-        
-        albedo, mr = pipeline.inpaint(albedo, albedo_mask, mr, mr_mask, vertex_inpaint, method)
+    def process(self, pipeline, albedo, albedo_mask, mr, mr_mask, output_mesh_name,
+                vertex_inpaint=True, inpaint_method="NS", inpaint_radius=3):
+
+        albedo, mr = pipeline.inpaint(albedo, albedo_mask, mr, mr_mask, vertex_inpaint, inpaint_method, inpaint_radius=inpaint_radius)
         
         pipeline.set_texture_albedo(albedo)
         pipeline.set_texture_mr(mr)
@@ -552,7 +737,7 @@ class Hy3D21CameraConfig:
     RETURN_TYPES = ("HY3D21CAMERA",)
     RETURN_NAMES = ("camera_config",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, camera_azimuths, camera_elevations, view_weights, ortho_scale):
         angles_list = list(map(int, camera_azimuths.replace(" ", "").split(',')))
@@ -583,7 +768,7 @@ class Hy3D21VAELoader:
     RETURN_TYPES = ("HY3DVAE",)
     RETURN_NAMES = ("vae",)
     FUNCTION = "loadmodel"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def loadmodel(self, model_name, vae_config=None):
         device = mm.get_torch_device()
@@ -648,7 +833,7 @@ class Hy3D21VAEConfig:
     RETURN_TYPES = ("HY3D21VAECONFIG",)
     RETURN_NAMES = ("vae_config",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, num_latents, embed_dim, num_freqs, include_pi, heads, width, num_encoder_layers, num_decoder_layers, qkv_bias, qk_norm, scale_factor, geo_decoder_mlp_expand_ratio, geo_decoder_downsample_ratio, geo_decoder_ln_post, point_feats, pc_size, pc_sharpedge_size):
         vae_config = {
@@ -695,7 +880,7 @@ class Hy3D21VAEDecode:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, vae, latents, box_v, octree_resolution, mc_level, num_chunks, mc_algo, enable_flash_vdm, force_offload):
         device = mm.get_torch_device()
@@ -751,7 +936,7 @@ class Hy3D21ResizeImages:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, images, width, height, sampling):        
         if sampling=='NEAREST':
@@ -800,7 +985,7 @@ class Hy3D21LoadImageWithTransparency:
                     {"image": (sorted(files), {"image_upload": True})},
                 }
 
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", )
     RETURN_NAMES = ("image", "mask", "image_with_alpha")
@@ -889,7 +1074,7 @@ class Hy3D21PostprocessMesh:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, trimesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
         new_mesh = trimesh.copy()
@@ -924,7 +1109,7 @@ class Hy3D21ExportMesh:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("glb_path",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     OUTPUT_NODE = True
 
     def process(self, trimesh, filename_prefix, file_format, save_file=True):
@@ -953,7 +1138,7 @@ class Hy3D21MeshUVWrap:
     RETURN_TYPES = ("TRIMESH", )
     RETURN_NAMES = ("trimesh", )
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, trimesh):
         trimesh = mesh_uv_wrap(trimesh)
@@ -973,7 +1158,7 @@ class Hy3D21LoadMesh:
     OUTPUT_TOOLTIPS = ("The glb model with mesh to texturize.",)
     
     FUNCTION = "load"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Loads a glb model from the given path."
 
     def load(self, glb_path):
@@ -1003,7 +1188,7 @@ class Hy3D21IMRemesh:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "remesh"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Remeshes the mesh using instant-meshes: https://github.com/wjakob/instant-meshes, Note: this will remove all vertex colors and textures."
 
     def remesh(self, trimesh, merge_vertices, vertex_count, smooth_iter, align_to_boundaries, triangulate_result, max_facenum):
@@ -1066,7 +1251,7 @@ class Hy3D21MeshlibDecimate:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "decimate"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Decimate the mesh using meshlib: https://meshlib.io/"
 
     def decimate(self, trimesh, subdivideParts, target_face_num=0,target_face_ratio=0.0,strategy="None",maxError=0.0,maxEdgeLen=0.0,maxBdShift=0.0,maxTriangleAspectRatio=0.0,criticalTriAspectRatio=0.0,tinyEdgeLength=0.0,stabilizer=0.0,angleWeightedDistToPlane=False,optimizeVertexPos=False,collapseNearNotFlippable=False,touchNearBdEdges=False,maxAngleChange=0.0,decimateBetweenParts=False,minFacesInPart=0):
@@ -1150,7 +1335,7 @@ class Hy3D21SimpleMeshlibDecimate:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "decimate"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Decimate the mesh using meshlib: https://meshlib.io/"
 
     def decimate(self, trimesh, subdivideParts, target_face_num=0,target_face_ratio=0.0):
@@ -1217,7 +1402,7 @@ class Hy3D21MeshGenerationBatch:
     RETURN_TYPES = ("STRING","STRING","STRING","STRING",)
     RETURN_NAMES = ("input_folder", "output_folder", "processed_input_images", "processed_output_meshes",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Process all pictures from a folder"
     OUTPUT_NODE = True
 
@@ -1388,6 +1573,7 @@ class Hy3D21GenerateMultiViewsBatch:
                 "export_metadata": ("BOOLEAN",{"default":True,"tooltip":"Exporta json file with camera config and multiviews"}),
             },
             "optional": {
+                "paint_model": ("HY3DPAINTMODEL", {"tooltip": "Pre-loaded paint model from Hy3DPaintModelLoader"}),
                 "input_images_folder": ("STRING",),
                 "input_meshes_folder": ("STRING",),
             }
@@ -1396,11 +1582,11 @@ class Hy3D21GenerateMultiViewsBatch:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("processed_meshes",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     DESCRIPTION = "Process all meshes from a folder"
     OUTPUT_NODE = True
 
-    def process(self, output_folder, camera_config, view_size, steps, guidance_scale, texture_size, unwrap_mesh, seed, generate_random_seed, remove_background, skip_generated_mesh, upscale_multiviews, upscale_model_name, export_multiviews, export_metadata, input_images_folder = None, input_meshes_folder = None):       
+    def process(self, output_folder, camera_config, view_size, steps, guidance_scale, texture_size, unwrap_mesh, seed, generate_random_seed, remove_background, skip_generated_mesh, upscale_multiviews, upscale_model_name, export_multiviews, export_metadata, paint_model=None, input_images_folder = None, input_meshes_folder = None):       
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()     
         rembg = BackgroundRemover()
@@ -1451,9 +1637,9 @@ class Hy3D21GenerateMultiViewsBatch:
                             if generate_random_seed:
                                 seed = int.from_bytes(os.urandom(4), 'big')
                                 
-                            trimesh = Trimesh.load(input_meshes[0])      
-                            
-                            paint_pipeline = Hunyuan3DPaintPipeline(conf)
+                            trimesh = Trimesh.load(input_meshes[0])
+
+                            paint_pipeline = _get_or_create_paint_pipeline(conf, paint_model=paint_model)
                             albedo, mr, normal_maps, position_maps = paint_pipeline(mesh=trimesh, image_path=image, output_mesh_path=temp_output_path, num_steps=steps, guidance_scale=guidance_scale, unwrap=unwrap_mesh, seed=seed)
                             
                             if export_multiviews:
@@ -1610,16 +1796,16 @@ class Hy3D21UseMultiViews:
     RETURN_TYPES = ("HY3DPIPELINE", "IMAGE","IMAGE","HY3D21CAMERA",)
     RETURN_NAMES = ("pipeline", "albedo","mr","camera_config",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, trimesh, camera_config, albedo, mr, view_size, texture_size):
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()
         
         conf = Hunyuan3DPaintConfig(view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"], camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
+        paint_pipeline = _get_or_create_paint_pipeline(conf)
         paint_pipeline.load_mesh(trimesh)
-        
+
         return (paint_pipeline, albedo, mr, camera_config)
 
 class Hy3D21UseMultiViewsFromMetaData:
@@ -1637,7 +1823,7 @@ class Hy3D21UseMultiViewsFromMetaData:
     RETURN_TYPES = ("HY3DPIPELINE", "IMAGE","IMAGE","HY3D21CAMERA",)
     RETURN_NAMES = ("pipeline", "albedo","mr","camera_config",)
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, trimesh, metadata_file, view_size, texture_size):
         device = mm.get_torch_device()
@@ -1650,8 +1836,8 @@ class Hy3D21UseMultiViewsFromMetaData:
                 setattr(loaded_metaData, key, value)        
         
         conf = Hunyuan3DPaintConfig(view_size, loaded_metaData.camera_config["selected_camera_azims"], loaded_metaData.camera_config["selected_camera_elevs"], loaded_metaData.camera_config["selected_view_weights"], loaded_metaData.camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
-              
+        paint_pipeline = _get_or_create_paint_pipeline(conf)
+
         paint_pipeline.load_mesh(trimesh)
         
         dir_name = os.path.dirname(metadata_file)
@@ -1703,26 +1889,29 @@ class Hy3D21MultiViewsGeneratorWithMetaData:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "output_name":("STRING",),
             },
+            "optional": {
+                "paint_model": ("HY3DPAINTMODEL", {"tooltip": "Pre-loaded paint model from Hy3DPaintModelLoader"}),
+            },
         }
 
     RETURN_TYPES = ("HY3DPIPELINE", "IMAGE","IMAGE","HY3D21METADATA","IMAGE","IMAGE",)
     RETURN_NAMES = ("pipeline", "albedo","mr","metadata","positions","normals",)
     FUNCTION = "genmultiviews"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
-    def genmultiviews(self, trimesh, camera_config, view_size, image, steps, guidance_scale, texture_size, unwrap_mesh, seed, output_name):
+    def genmultiviews(self, trimesh, camera_config, view_size, image, steps, guidance_scale, texture_size, unwrap_mesh, seed, output_name, paint_model=None):
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()
-        
+
         seed = seed % (2**32)
-        
+
         conf = Hunyuan3DPaintConfig(view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"], camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
-        
+        paint_pipeline = _get_or_create_paint_pipeline(conf, paint_model=paint_model)
+
         image = tensor2pil(image)
-        
+
         temp_folder_path = os.path.join(comfy_path, "temp")
-        os.makedirs(temp_folder_path, exist_ok=True)        
+        os.makedirs(temp_folder_path, exist_ok=True)
         temp_output_path = os.path.join(temp_folder_path, "textured_mesh.obj")
         
         albedo, mr, normal_maps, position_maps = paint_pipeline(mesh=trimesh, image_path=image, output_mesh_path=temp_output_path, num_steps=steps, guidance_scale=guidance_scale, unwrap=unwrap_mesh, seed=seed)
@@ -1771,7 +1960,7 @@ class Hy3DBakeMultiViewsWithMetaData:
     RETURN_TYPES = ("IMAGE","IMAGE","TRIMESH", "STRING", )
     RETURN_NAMES = ("albedo", "mr", "trimesh", "output_glb_path", )
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
 
     def process(self, pipeline, albedo, mr, metadata):  
         vertex_inpaint = True
@@ -1853,7 +2042,7 @@ class Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData:
     RETURN_TYPES = ("STRING", )
     RETURN_NAMES = ("output_lowpoly_path", )
     FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
     OUTPUT_NODE = True
 
     def process(self, metadata_file, view_size, texture_size, target_face_nums):   
@@ -1918,7 +2107,7 @@ class Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData:
                 
                 for target_face_num in list_of_faces:
                     print('Processing {target_face_num} faces ...')
-                    pipeline = Hunyuan3DPaintPipeline(conf)
+                    pipeline = _get_or_create_paint_pipeline(conf)
                     output_dir_path = os.path.join(input_dir, "LowPoly", f"{target_face_num}")
                     os.makedirs(output_dir_path, exist_ok=True)
                     
@@ -1955,60 +2144,94 @@ class Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData:
         else:
             print('target_face_nums is empty')       
         
-        return (output_lowpoly_path,)        
+        return (output_lowpoly_path,)
+
+
+class Hy3DUpscaleMultiViews:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "albedo": ("IMAGE",),
+                "mr": ("IMAGE",),
+                "upscale_model_name": (folder_paths.get_filename_list("upscale_models"), ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE",)
+    RETURN_NAMES = ("upscaled_albedo", "upscaled_mr",)
+    FUNCTION = "upscale"
+    CATEGORY = "Hunyuan3D21Wrapper-Mixar"
+
+    def upscale(self, albedo, mr, upscale_model_name):
+        device = mm.get_torch_device()
+        upscale_model = _get_or_load_upscale_model(upscale_model_name, device)
+
+        print("[Hy3DUpscaleMultiViews] Upscaling albedo...")
+        upscaled_albedo = _upscale_images(albedo, upscale_model, device)
+
+        print("[Hy3DUpscaleMultiViews] Upscaling MR...")
+        upscaled_mr = _upscale_images(mr, upscale_model, device)
+
+        return (upscaled_albedo, upscaled_mr,)
+
 
 NODE_CLASS_MAPPINGS = {
-    "Hy3DMeshGenerator": Hy3DMeshGenerator,
-    "Hy3DMultiViewsGenerator": Hy3DMultiViewsGenerator,
-    "Hy3DBakeMultiViews": Hy3DBakeMultiViews,
-    "Hy3DInPaint": Hy3DInPaint,
-    "Hy3D21CameraConfig": Hy3D21CameraConfig,
-    "Hy3D21VAELoader": Hy3D21VAELoader,
-    "Hy3D21VAEDecode": Hy3D21VAEDecode,
-    "Hy3D21VAEConfig": Hy3D21VAEConfig,
-    "Hy3D21ResizeImages": Hy3D21ResizeImages,
-    "Hy3D21LoadImageWithTransparency": Hy3D21LoadImageWithTransparency,
-    "Hy3D21PostprocessMesh": Hy3D21PostprocessMesh,
-    "Hy3D21ExportMesh": Hy3D21ExportMesh,
-    "Hy3D21MeshUVWrap": Hy3D21MeshUVWrap,
-    "Hy3D21LoadMesh": Hy3D21LoadMesh,
-    "Hy3D21IMRemesh": Hy3D21IMRemesh,
-    "Hy3D21MeshlibDecimate": Hy3D21MeshlibDecimate,
-    "Hy3D21MeshGenerationBatch": Hy3D21MeshGenerationBatch,
-    "Hy3D21GenerateMultiViewsBatch": Hy3D21GenerateMultiViewsBatch,
-    "Hy3D21UseMultiViews": Hy3D21UseMultiViews,
-    "Hy3D21UseMultiViewsFromMetaData": Hy3D21UseMultiViewsFromMetaData,
-    "Hy3D21MultiViewsGeneratorWithMetaData": Hy3D21MultiViewsGeneratorWithMetaData,
-    "Hy3DBakeMultiViewsWithMetaData": Hy3DBakeMultiViewsWithMetaData,
-    "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData,
-    "Hy3D21SimpleMeshlibDecimate": Hy3D21SimpleMeshlibDecimate,
-    #"Hy3D21MultiViewsMeshGenerator": Hy3D21MultiViewsMeshGenerator,
+    "Hy3DPaintModelLoader-Mixar": Hy3DPaintModelLoader,
+    "Hy3DMeshGenerator-Mixar": Hy3DMeshGenerator,
+    "Hy3DMultiViewsGenerator-Mixar": Hy3DMultiViewsGenerator,
+    "Hy3DBakeMultiViews-Mixar": Hy3DBakeMultiViews,
+    "Hy3DInPaint-Mixar": Hy3DInPaint,
+    "Hy3D21CameraConfig-Mixar": Hy3D21CameraConfig,
+    "Hy3D21VAELoader-Mixar": Hy3D21VAELoader,
+    "Hy3D21VAEDecode-Mixar": Hy3D21VAEDecode,
+    "Hy3D21VAEConfig-Mixar": Hy3D21VAEConfig,
+    "Hy3D21ResizeImages-Mixar": Hy3D21ResizeImages,
+    "Hy3D21LoadImageWithTransparency-Mixar": Hy3D21LoadImageWithTransparency,
+    "Hy3D21PostprocessMesh-Mixar": Hy3D21PostprocessMesh,
+    "Hy3D21ExportMesh-Mixar": Hy3D21ExportMesh,
+    "Hy3D21MeshUVWrap-Mixar": Hy3D21MeshUVWrap,
+    "Hy3D21LoadMesh-Mixar": Hy3D21LoadMesh,
+    "Hy3D21IMRemesh-Mixar": Hy3D21IMRemesh,
+    "Hy3D21MeshlibDecimate-Mixar": Hy3D21MeshlibDecimate,
+    "Hy3D21MeshGenerationBatch-Mixar": Hy3D21MeshGenerationBatch,
+    "Hy3D21GenerateMultiViewsBatch-Mixar": Hy3D21GenerateMultiViewsBatch,
+    "Hy3D21UseMultiViews-Mixar": Hy3D21UseMultiViews,
+    "Hy3D21UseMultiViewsFromMetaData-Mixar": Hy3D21UseMultiViewsFromMetaData,
+    "Hy3D21MultiViewsGeneratorWithMetaData-Mixar": Hy3D21MultiViewsGeneratorWithMetaData,
+    "Hy3DBakeMultiViewsWithMetaData-Mixar": Hy3DBakeMultiViewsWithMetaData,
+    "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData-Mixar": Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData,
+    "Hy3D21SimpleMeshlibDecimate-Mixar": Hy3D21SimpleMeshlibDecimate,
+    "Hy3DUpscaleMultiViews-Mixar": Hy3DUpscaleMultiViews,
+    #"Hy3D21MultiViewsMeshGenerator-Mixar": Hy3D21MultiViewsMeshGenerator,
     }
-    
+
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Hy3DMeshGenerator": "Hunyuan 3D 2.1 Mesh Generator",
-    "Hy3DMultiViewsGenerator": "Hunyuan 3D 2.1 MultiViews Generator",
-    "Hy3DBakeMultiViews": "Hunyuan 3D 2.1 Bake MultiViews",
-    "Hy3DInPaint": "Hunyuan 3D 2.1 InPaint",
-    "Hy3D21CameraConfig": "Hunyuan 3D 2.1 Camera Config",
-    "Hy3D21VAELoader": "Hunyuan 3D 2.1 VAE Loader",
-    "Hy3D21VAEDecode": "Hunyuan 3D 2.1 VAE Decoder",
-    "Hy3D21VAEConfig": "Hunyuan 3D 2.1 VAE Config",
-    "Hy3D21ResizeImages": "Hunyuan 3D 2.1 Resize Images",
-    "Hy3D21LoadImageWithTransparency": "Hunyuan 3D 2.1 Load Image with Transparency",
-    "Hy3D21PostprocessMesh": "Hunyuan 3D 2.1 Post Process Trimesh",
-    "Hy3D21ExportMesh": "Hunyuan 3D 2.1 Export Mesh",
-    "Hy3D21MeshUVWrap": "Hunyuan 3D 2.1 Mesh UV Wrap",
-    "Hy3D21LoadMesh": "Hunyuan 3D 2.1 Load Mesh",
-    "Hy3D21IMRemesh": "Hunyuan 3D 2.1 Instant-Meshes Remesh",
-    "Hy3D21MeshlibDecimate": "Hunyuan 3D 2.1 Meshlib Decimation",
-    "Hy3D21MeshGenerationBatch": "Hunyuan 3D 2.1 Mesh Generator from Folder",
-    "Hy3D21GenerateMultiViewsBatch": "Hunyuan 3D 2.1 MultiViews Generator Batch",
-    "Hy3D21UseMultiViews": "Hunyuan 3D 2.1 Use MultiViews",
-    "Hy3D21UseMultiViewsFromMetaData": "Hunyuan 3D 2.1 Use MultiViews From MetaData",
-    "Hy3D21MultiViewsGeneratorWithMetaData": "Hunyuan 3D 2.1 MultiViews Generator With MetaData",
-    "Hy3DBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 Bake MultiViews With MetaData",
-    "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 HighPoly to LowPoly Bake MultiViews With MetaData",
-    "Hy3D21SimpleMeshlibDecimate": "Hunyuan 3D 2.1 Simple Meshlib Decimation",
-    #"Hy3D21MultiViewsMeshGenerator": "Hunyuan 3D 2.1 MultiViews Mesh Generator"
+    "Hy3DPaintModelLoader-Mixar": "Hunyuan 3D 2.1 Paint Model Loader -Mixar",
+    "Hy3DMeshGenerator-Mixar": "Hunyuan 3D 2.1 Mesh Generator -Mixar",
+    "Hy3DMultiViewsGenerator-Mixar": "Hunyuan 3D 2.1 MultiViews Generator -Mixar",
+    "Hy3DBakeMultiViews-Mixar": "Hunyuan 3D 2.1 Bake MultiViews -Mixar",
+    "Hy3DInPaint-Mixar": "Hunyuan 3D 2.1 InPaint -Mixar",
+    "Hy3D21CameraConfig-Mixar": "Hunyuan 3D 2.1 Camera Config -Mixar",
+    "Hy3D21VAELoader-Mixar": "Hunyuan 3D 2.1 VAE Loader -Mixar",
+    "Hy3D21VAEDecode-Mixar": "Hunyuan 3D 2.1 VAE Decoder -Mixar",
+    "Hy3D21VAEConfig-Mixar": "Hunyuan 3D 2.1 VAE Config -Mixar",
+    "Hy3D21ResizeImages-Mixar": "Hunyuan 3D 2.1 Resize Images -Mixar",
+    "Hy3D21LoadImageWithTransparency-Mixar": "Hunyuan 3D 2.1 Load Image with Transparency -Mixar",
+    "Hy3D21PostprocessMesh-Mixar": "Hunyuan 3D 2.1 Post Process Trimesh -Mixar",
+    "Hy3D21ExportMesh-Mixar": "Hunyuan 3D 2.1 Export Mesh -Mixar",
+    "Hy3D21MeshUVWrap-Mixar": "Hunyuan 3D 2.1 Mesh UV Wrap -Mixar",
+    "Hy3D21LoadMesh-Mixar": "Hunyuan 3D 2.1 Load Mesh -Mixar",
+    "Hy3D21IMRemesh-Mixar": "Hunyuan 3D 2.1 Instant-Meshes Remesh -Mixar",
+    "Hy3D21MeshlibDecimate-Mixar": "Hunyuan 3D 2.1 Meshlib Decimation -Mixar",
+    "Hy3D21MeshGenerationBatch-Mixar": "Hunyuan 3D 2.1 Mesh Generator from Folder -Mixar",
+    "Hy3D21GenerateMultiViewsBatch-Mixar": "Hunyuan 3D 2.1 MultiViews Generator Batch -Mixar",
+    "Hy3D21UseMultiViews-Mixar": "Hunyuan 3D 2.1 Use MultiViews -Mixar",
+    "Hy3D21UseMultiViewsFromMetaData-Mixar": "Hunyuan 3D 2.1 Use MultiViews From MetaData -Mixar",
+    "Hy3D21MultiViewsGeneratorWithMetaData-Mixar": "Hunyuan 3D 2.1 MultiViews Generator With MetaData -Mixar",
+    "Hy3DBakeMultiViewsWithMetaData-Mixar": "Hunyuan 3D 2.1 Bake MultiViews With MetaData -Mixar",
+    "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData-Mixar": "Hunyuan 3D 2.1 HighPoly to LowPoly Bake MultiViews With MetaData -Mixar",
+    "Hy3D21SimpleMeshlibDecimate-Mixar": "Hunyuan 3D 2.1 Simple Meshlib Decimation -Mixar",
+    "Hy3DUpscaleMultiViews-Mixar": "Hunyuan 3D 2.1 Upscale MultiViews -Mixar",
+    #"Hy3D21MultiViewsMeshGenerator-Mixar": "Hunyuan 3D 2.1 MultiViews Mesh Generator -Mixar"
     }
