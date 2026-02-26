@@ -38,12 +38,19 @@ from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
-    # 执行转换
-    textures = {
-        'albedo': obj_path.replace('.obj', '.jpg'),
-        'metallic': obj_path.replace('.obj', '_metallic.jpg'),
-        'roughness': obj_path.replace('.obj', '_roughness.jpg')
-        }
+    base_path = os.path.splitext(obj_path)[0]
+    textures = {}
+
+    albedo_path = f"{base_path}.jpg"
+    if os.path.isfile(albedo_path):
+        textures['albedo'] = albedo_path
+
+    metallic_path = f"{base_path}_metallic.jpg"
+    roughness_path = f"{base_path}_roughness.jpg"
+    if os.path.isfile(metallic_path) and os.path.isfile(roughness_path):
+        textures['metallic'] = metallic_path
+        textures['roughness'] = roughness_path
+
     create_glb_with_pbr_materials(obj_path, textures, glb_path)
 
 class Hunyuan3DPaintConfig:
