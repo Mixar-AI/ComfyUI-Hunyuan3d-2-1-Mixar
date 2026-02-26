@@ -38,16 +38,31 @@ from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
-    # 执行转换
-    textures = {
-        'albedo': obj_path.replace('.obj', '.jpg'),
-        'metallic': obj_path.replace('.obj', '_metallic.jpg'),
-        'roughness': obj_path.replace('.obj', '_roughness.jpg')
-        }
+    base_path = os.path.splitext(obj_path)[0]
+    textures = {}
+
+    albedo_path = f"{base_path}.jpg"
+    if os.path.isfile(albedo_path):
+        textures['albedo'] = albedo_path
+
+    metallic_path = f"{base_path}_metallic.jpg"
+    roughness_path = f"{base_path}_roughness.jpg"
+    if os.path.isfile(metallic_path) and os.path.isfile(roughness_path):
+        textures['metallic'] = metallic_path
+        textures['roughness'] = roughness_path
+
     create_glb_with_pbr_materials(obj_path, textures, glb_path)
 
 class Hunyuan3DPaintConfig:
-    def __init__(self, resolution, camera_azims, camera_elevs, view_weights, ortho_scale, texture_size):
+    def __init__(self, resolution, camera_azims, camera_elevs, view_weights, ortho_scale, texture_size,
+                 scheduler="EulerAncestralDiscrete",
+                 render_size=1024,
+                 bake_exp=4,
+                 bake_angle_thres=75.0,
+                 bake_mode="back_sample",
+                 camera_distance=1.1,
+                 guidance_rescale=0.0,
+                 mesh_scale_factor=1.15):
         self.device = "cuda"
 
         cfg_path = os.path.join(
@@ -56,17 +71,20 @@ class Hunyuan3DPaintConfig:
 
         self.multiview_cfg_path = cfg_path
         self.custom_pipeline = "hunyuanpaintpbr"
-        self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
-        self.dino_ckpt_path = "facebook/dinov2-giant"
         self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
 
         self.raster_mode = "cr"
-        self.bake_mode = "back_sample"
-        self.render_size = 1024
+        self.scheduler = scheduler
+        self.bake_mode = bake_mode
+        self.render_size = render_size
         self.texture_size = texture_size
         self.max_selected_view_num = 32
         self.resolution = resolution
-        self.bake_exp = 4
+        self.bake_exp = bake_exp
+        self.bake_angle_thres = bake_angle_thres
+        self.camera_distance = camera_distance
+        self.guidance_rescale = guidance_rescale
+        self.mesh_scale_factor = mesh_scale_factor
         self.merge_method = "fast"
         self.ortho_scale = ortho_scale
 
@@ -90,16 +108,19 @@ class Hunyuan3DPaintConfig:
 
 class Hunyuan3DPaintPipeline:
 
-    def __init__(self, config=None) -> None:
+    def __init__(self, config=None, paint_model=None) -> None:
         self.config = config if config is not None else Hunyuan3DPaintConfig()
         self.model = None
+        self.paint_model = paint_model
         self.stats_logs = {}
         self.render = MeshRender(
             default_resolution=self.config.render_size,
             texture_size=self.config.texture_size,
             bake_mode=self.config.bake_mode,
             raster_mode=self.config.raster_mode,
-            ortho_scale=self.config.ortho_scale
+            ortho_scale=self.config.ortho_scale,
+            camera_distance=self.config.camera_distance,
+            bake_angle_thres=self.config.bake_angle_thres
         )
         self.view_processor = ViewProcessor(self.config, self.render)
         #self.load_models()
@@ -111,10 +132,10 @@ class Hunyuan3DPaintPipeline:
         print("Models Loaded.")
 
     @torch.no_grad()
-    def __call__(self, mesh, image_path=None, output_mesh_path=None, use_remesh=False, save_glb=True, num_steps=10, guidance_scale=3.0, unwrap=True, seed=0):
+    def __call__(self, mesh, image_path=None, output_mesh_path=None, use_remesh=False, save_glb=True, num_steps=10, guidance_scale=3.0, unwrap=True, seed=0, guidance_rescale=0.0):
         """Generate texture for 3D mesh using multiview diffusion"""
         if self.model == None:
-            self.model = multiviewDiffusionNet(self.config)
+            self.model = multiviewDiffusionNet(self.config, paint_model=self.paint_model)
         
         # Ensure image_prompt is a list
         if isinstance(image_path, str):
@@ -145,7 +166,7 @@ class Hunyuan3DPaintPipeline:
             print('Unwrapping Mesh ...')
             mesh = mesh_uv_wrap(mesh)
             
-        self.render.load_mesh(mesh=mesh)
+        self.render.load_mesh(mesh=mesh, scale_factor=self.config.mesh_scale_factor)
 
         ########### View Selection #########
         # selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
@@ -188,7 +209,9 @@ class Hunyuan3DPaintPipeline:
             resize_input=True,
             num_steps=num_steps,
             guidance_scale=guidance_scale,
-            seed=seed
+            seed=seed,
+            camera_azims=selected_camera_azims,
+            guidance_rescale=guidance_rescale
         )
         
         return multiviews_pbr["albedo"], multiviews_pbr["mr"], normal_maps, position_maps
@@ -254,14 +277,14 @@ class Hunyuan3DPaintPipeline:
         
         return output_glb_path
         
-    def inpaint(self, albedo, albedo_mask, mr, mr_mask, vertex_inpaint, method):
+    def inpaint(self, albedo, albedo_mask, mr, mr_mask, vertex_inpaint, method, inpaint_radius=3):
         #mask_np = np.asarray(albedo)
         mask_np = (albedo_mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-        texture = self.view_processor.texture_inpaint(albedo, mask_np, vertex_inpaint, method)
-        
+        texture = self.view_processor.texture_inpaint(albedo, mask_np, vertex_inpaint, method, inpaint_radius=inpaint_radius)
+
         mask_mr_np = (mr_mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
         #mask_mr_np = np.asarray(mr_mask)
-        texture_mr = self.view_processor.texture_inpaint(mr, mask_mr_np, vertex_inpaint, method)
+        texture_mr = self.view_processor.texture_inpaint(mr, mask_mr_np, vertex_inpaint, method, inpaint_radius=inpaint_radius)
         
         return texture, texture_mr
         
@@ -278,15 +301,23 @@ class Hunyuan3DPaintPipeline:
         return texture, mask, texture_mr, mask_mr
         
     def clean_memory(self):
+        if getattr(self, '_cached', False):
+            # Pipeline is cached — keep render/view_processor/model for reuse
+            mm.soft_empty_cache()
+            gc.collect()
+            return
+
         del self.render
         del self.view_processor
-        del self.model
-        
+        if self.paint_model is None:
+            # Only delete model if it was internally created (not from loader node)
+            del self.model
+
         mm.soft_empty_cache()
         torch.cuda.empty_cache()
-        gc.collect()    
+        gc.collect()
         
-    def load_mesh(self, mesh):
-        self.render.load_mesh(mesh=mesh)
+    def load_mesh(self, mesh, scale_factor=1.15):
+        self.render.load_mesh(mesh=mesh, scale_factor=scale_factor)
         
         

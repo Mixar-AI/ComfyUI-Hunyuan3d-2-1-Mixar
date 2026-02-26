@@ -123,13 +123,13 @@ class ViewProcessor:
             texture, ori_trust_map = self.render.fast_bake_texture(project_textures, project_weighted_cos_maps)
         return texture, ori_trust_map > 1e-8
 
-    def texture_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", default=None, ):
+    def texture_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", default=None, inpaint_radius=3):
         if default is not None:
             mask = mask.astype(bool)
             inpaint_value = torch.tensor(default, dtype=texture.dtype, device=texture.device)
             texture[~mask] = inpaint_value
         else:
-            texture_np = self.render.uv_inpaint(texture, mask, vertex_inpaint, method)
+            texture_np = self.render.uv_inpaint(texture, mask, vertex_inpaint, method, inpaint_radius=inpaint_radius)
             texture = torch.tensor(texture_np / 255).float().to(texture.device)
 
         return texture

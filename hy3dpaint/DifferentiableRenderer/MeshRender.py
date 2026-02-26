@@ -334,7 +334,8 @@ class MeshRender:
         shader_type="face",
         use_opengl=False,
         device="cuda",
-        ortho_scale=1.0
+        ortho_scale=1.0,
+        bake_angle_thres=75.0
     ):
         """
         Initialize mesh renderer with configurable parameters.
@@ -363,7 +364,7 @@ class MeshRender:
         self.use_antialias = use_antialias
         self.max_mip_level = max_mip_level
         self.filter_mode = filter_mode
-        self.bake_angle_thres = 75
+        self.bake_angle_thres = bake_angle_thres
         self.set_boundary_unreliable_scale(2)
         self.bake_mode = bake_mode
         self.shader_type = shader_type
@@ -1378,7 +1379,7 @@ class MeshRender:
         return texture_merge, trust_map_merge > 1e-8
 
     @torch.no_grad()
-    def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", return_float=False):
+    def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", return_float=False, inpaint_radius=3):
         """
         Inpaint missing regions in UV texture using mesh-aware and traditional methods.
         
@@ -1408,7 +1409,10 @@ class MeshRender:
             texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
 
         if method == "NS":
-            texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_NS)
+            texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, inpaint_radius, cv2.INPAINT_NS)
+            assert return_float == False
+        elif method == "TELEA":
+            texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, inpaint_radius, cv2.INPAINT_TELEA)
             assert return_float == False
 
         return texture_np
