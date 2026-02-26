@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import trimesh as Trimesh
 import gc
 import json
+import tempfile
 from .hy3dshape.hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
 from .hy3dshape.hy3dshape.postprocessors import FaceReducer, FloaterRemover, DegenerateFaceRemover
 from .hy3dshape.hy3dshape.rembg import BackgroundRemover
@@ -672,7 +673,6 @@ class Hy3DInPaint:
                 "albedo_mask": ("NPARRAY", ),
                 "mr": ("NPARRAY", ),
                 "mr_mask": ("NPARRAY",),
-                "output_mesh_name": ("STRING",),
             },
             "optional": {
                 "vertex_inpaint": ("BOOLEAN", {"default": True, "tooltip": "Use mesh-aware inpainting first pass"}),
@@ -681,46 +681,39 @@ class Hy3DInPaint:
             },
         }
 
-    RETURN_TYPES = ("IMAGE","IMAGE","TRIMESH", "STRING",)
-    RETURN_NAMES = ("albedo", "mr", "trimesh", "output_glb_path")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "TRIMESH",)
+    RETURN_NAMES = ("albedo", "mr", "trimesh",)
     FUNCTION = "process"
     CATEGORY = "Hunyuan3D21Wrapper-Mixar"
-    OUTPUT_NODE = True
 
-    def process(self, pipeline, albedo, albedo_mask, mr, mr_mask, output_mesh_name,
+    def process(self, pipeline, albedo, albedo_mask, mr, mr_mask,
                 vertex_inpaint=True, inpaint_method="NS", inpaint_radius=3):
 
         albedo, mr = pipeline.inpaint(albedo, albedo_mask, mr, mr_mask, vertex_inpaint, inpaint_method, inpaint_radius=inpaint_radius)
-        
+
         pipeline.set_texture_albedo(albedo)
         pipeline.set_texture_mr(mr)
 
-        temp_folder_path = os.path.join(comfy_path, "temp")
-        os.makedirs(temp_folder_path, exist_ok=True)        
-        output_mesh_path = os.path.join(temp_folder_path, f"{output_mesh_name}.obj")
-        output_temp_path = pipeline.save_mesh(output_mesh_path)
-        
-        output_glb_path = os.path.join(comfy_path, "output", f"{output_mesh_name}.glb")
-        shutil.copyfile(output_temp_path, output_glb_path)
-        
-        trimesh = Trimesh.load(output_glb_path, force="mesh")
-        
+        # Build textured trimesh via temp roundtrip (needed for PBR material embedding)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            obj_path = os.path.join(tmpdir, "mesh.obj")
+            glb_path = pipeline.save_mesh(obj_path)
+            trimesh = Trimesh.load(glb_path, force="mesh")
+
         texture_pil = convert_ndarray_to_pil(albedo)
         texture_mr_pil = convert_ndarray_to_pil(mr)
         texture_tensor = pil2tensor(texture_pil)
         texture_mr_tensor = pil2tensor(texture_mr_pil)
-        
-        output_glb_path = f"{output_mesh_name}.glb"
-        
+
         pipeline.clean_memory()
-        
+
         del pipeline
-        
+
         mm.soft_empty_cache()
         torch.cuda.empty_cache()
-        gc.collect()        
-        
-        return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)         
+        gc.collect()
+
+        return (texture_tensor, texture_mr_tensor, trimesh,)         
         
 class Hy3D21CameraConfig:
     @classmethod
